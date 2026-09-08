@@ -260,6 +260,8 @@ function computeSobelMagnitude(img, res){
   // basse (volume alto) il marching squares lo scambia per un vero
   // contorno, disegnando solo il perimetro dell'immagine. Fix: replica il
   // valore piu' vicino (clamp-to-edge), come un bordo Sobel dovrebbe fare.
+  // Va fatto PRIMA della sfocatura qui sotto, altrimenti lo zero finto si
+  // spargerebbe nei pixel veri vicino al bordo.
   for(let x=0;x<res;x++){
     mag[x] = mag[res+x];
     mag[(res-1)*res+x] = mag[(res-2)*res+x];
@@ -268,15 +270,40 @@ function computeSobelMagnitude(img, res){
     mag[y*res] = mag[y*res+1];
     mag[y*res+(res-1)] = mag[y*res+(res-2)];
   }
-  // percentili REALI del campo (non un numero fisso globale): la
+  // sfocatura leggera del campo (due passate di box blur 3x3 ~ una piccola
+  // gaussiana): il grano del JPEG crea migliaia di micro-picchi isolati nel
+  // campo Sobel che, alla soglia, diventano altrettanti minuscoli anelli
+  // scollegati dal disegno vero — questo e' il principale motivo per cui il
+  // tratto sembrava "spezzato", non la geometria delle curve. Sfocare PRIMA
+  // di tracciare i contorni sopprime il rumore pixel-per-pixel mantenendo
+  // le vere venature (che sono larghe piu' pixel, non un singolo punto).
+  const blurred = boxBlur3x3(boxBlur3x3(mag, res), res);
+  // percentili REALI del campo sfocato (non un numero fisso globale): la
   // distribuzione dei valori Sobel varia moltissimo da marmo a marmo
   // (mediana ~23 per un marmo tenue, ~103 per uno molto inciso) — una
   // soglia assoluta uguale per tutti va spesso fuori scala. p88 = soglia
   // "rada" (poche venature, le piu' marcate), p50 = soglia "densa" (la
   // meta' del campo, il punto di massimo dettaglio del contorno).
-  const sorted = Array.from(mag).sort((a,b)=>a-b);
+  const sorted = Array.from(blurred).sort((a,b)=>a-b);
   const pct = p => sorted[Math.floor(p*(sorted.length-1))];
-  return { mag, p50: pct(0.50), p88: pct(0.88) };
+  return { mag: blurred, p50: pct(0.50), p88: pct(0.88) };
+}
+function boxBlur3x3(src, res){
+  const h = new Float32Array(res*res);
+  for(let y=0;y<res;y++){
+    for(let x=0;x<res;x++){
+      const xm = x>0?x-1:x, xp = x<res-1?x+1:x;
+      h[y*res+x] = (src[y*res+xm]+src[y*res+x]+src[y*res+xp])/3;
+    }
+  }
+  const out = new Float32Array(res*res);
+  for(let y=0;y<res;y++){
+    const ym = y>0?y-1:y, yp = y<res-1?y+1:y;
+    for(let x=0;x<res;x++){
+      out[y*res+x] = (h[ym*res+x]+h[y*res+x]+h[yp*res+x])/3;
+    }
+  }
+  return out;
 }
 function loadAllMarbles(){
   const notes = Object.keys(MARBLE_B64);
@@ -962,16 +989,25 @@ function computeBands(cell){
   return {polylines, level};
 }
 
+// ph e chaosPh sono GIA' la fase corretta (accumulata in advanceVisualPhase
+// alla frequenza voluta, lfoRateHz-derivata) — qui NON si moltiplica piu'
+// per fattori extra (era *6.2, *5.4, e per il caos fino a *17): quei
+// moltiplicatori spingevano la frequenza EFFETTIVA del tremore ben oltre i
+// 50Hz a risonanza alta, molto oltre quello che l'occhio legge come
+// tremore — sembrava percio' un flicker uniforme su tutto il canvas
+// (l'"oscillazione omologata illeggibile" segnalata), non un'oscillazione
+// coerente con l'audio. Piccoli scarti (1.0/0.87 ecc.) restano solo per
+// decorrelare leggermente x da y, non per accelerare il tempo.
 function jitterFlat(flat, ph, vibAmt, chaosAmt, chaosPh){
   const out = new Array(flat.length);
   for(let i=0;i<flat.length;i+=2){
     const x = flat[i], y = flat[i+1];
-    const w1 = Math.sin((x*9.0+y*5.0)*Math.PI*2 + ph*6.2);
-    const w2 = Math.cos((x*5.0+y*9.0)*Math.PI*2 + ph*5.4+1.3);
+    const w1 = Math.sin((x*9.0+y*5.0)*Math.PI*2 + ph);
+    const w2 = Math.cos((x*5.0+y*9.0)*Math.PI*2 + ph*0.87+1.3);
     let dx = w1*vibAmt, dy = w2*vibAmt;
     if(chaosAmt>0.0001){
-      const c1 = Math.sin((x*41.0+y*23.0) + chaosPh*17.0) * Math.cos((x*19.0-y*31.0)+chaosPh*11.3);
-      const c2 = Math.cos((x*29.0-y*37.0) + chaosPh*14.7) * Math.sin((x*33.0+y*13.0)+chaosPh*9.1);
+      const c1 = Math.sin((x*41.0+y*23.0) + chaosPh) * Math.cos((x*19.0-y*31.0)+chaosPh*0.72);
+      const c2 = Math.cos((x*29.0-y*37.0) + chaosPh*0.91) * Math.sin((x*33.0+y*13.0)+chaosPh*0.58);
       dx += c1*chaosAmt; dy += c2*chaosAmt;
     }
     out[i]   = x + dx;
@@ -1006,12 +1042,21 @@ function spatialHash(x,y){
 // pulviscolo piccolo e nitido (nucleo netto + alone sottile), non "zoomato":
 // il raggio e' scalato su destSize cosi' resta identico in proporzione sia
 // in SOLO sia nei quattro quadranti di CHORD.
-function drawParticlesAlongPath(pts, destSize, scale, strokeRGB, particleAlpha, ph){
+// "fib" qui non e' solo un moltiplicatore d'opacita': decide anche QUANTI
+// vertici mostrano una particella (hash stabile per vertice confrontato
+// con la soglia 1-fib). Cosi' a fibrillazione bassa solo pochi punti sparsi
+// iniziano a "scintillare" sulla linea ancora quasi intera, e salendo se ne
+// accendono sempre di piu' fino a coprirli tutti — si sfalda gradualmente,
+// invece di un pulviscolo uniforme e debole che compare tutto insieme
+// (il "passaggio troppo brusco" segnalato).
+function drawParticlesAlongPath(pts, destSize, scale, strokeRGB, particleAlpha, ph, fib){
   sctx.fillStyle = strokeRGB;
   for(let i=0;i<pts.length;i+=2){
+    const gate = spatialHash(pts[i]*3.7+0.021, pts[i+1]*3.7-0.037);
+    if(gate > fib) continue;
     const px = pts[i]*destSize, py = pts[i+1]*destSize;
     const h = spatialHash(pts[i], pts[i+1]);
-    const pulse = 0.5 + 0.5*Math.sin(ph*4.0 + h*Math.PI*2);
+    const pulse = 0.5 + 0.5*Math.sin(ph*1.3 + h*Math.PI*2);
     const hx = spatialHash(pts[i]+0.011, pts[i+1]-0.013);
     const spread = 1.3*scale;
     const ox = (hx-0.5)*spread, oy = (spatialHash(hx,h)-0.5)*spread;
@@ -1030,24 +1075,40 @@ function drawBandsInto(bandsData, destX, destY, destSize, color, flipH, flipV, v
   const baseWidth = mapRange(AudioFeatures.lowE, 0, 1, 0.95, 2.1);
   const strokeRGB = rgbStr(color);
   const baseAlpha = bandsData.level>0 ? Math.min(1, bandsData.level*1.6 + 0.15) : 0;
-  const lineAlpha = Math.min(1, baseAlpha*(1-fibrillation*0.85) + onsetPulse*0.25);
+  // la linea sfuma quasi del tutto (non piu' un fantasma residuo al 15%)
+  // cosi' a fibrillazione piena non compete piu' visivamente col pulviscolo
+  const lineAlpha = Math.min(1, baseAlpha*(1-fibrillation*0.97) + onsetPulse*0.25);
   const showParticles = fibrillation>0.02;
-  const particleAlpha = baseAlpha*fibrillation;
+  // l'opacita' di OGNI particella visibile resta piena (baseAlpha): e'
+  // "fibrillation" a decidere QUANTI vertici ne mostrano una (vedi
+  // drawParticlesAlongPath) — cosi' le prime scintille, per quanto rade,
+  // si vedono chiaramente invece di essere anche loro sbiadite
+  const particleAlpha = baseAlpha;
   const scale = destSize/640;
 
-  if(lineAlpha>0.003) sctx.beginPath();
-  bandsData.polylines.forEach(poly=>{
-    const pts = jitterFlat(poly, vib.ph, vib.vibAmt, vib.chaosAmt, vib.chaosPh);
-    if(lineAlpha>0.003) strokeSmoothPath(sctx, pts, destSize);
-    if(showParticles) drawParticlesAlongPath(pts, destSize, scale, strokeRGB, particleAlpha, vib.ph);
-  });
+  // jitter calcolato una volta sola per polilinea, poi riusato sia per la
+  // linea che per le particelle — e le due fasi di disegno sono SEPARATE:
+  // drawParticlesAlongPath chiama beginPath() per ogni singolo punto (serve
+  // per disegnare cerchi indipendenti), e se venisse interfogliata con
+  // l'accumulo del path della linea (come prima) quel beginPath() cancella
+  // silenziosamente tutto cio' che stroke() avrebbe dovuto disegnare — la
+  // linea spariva SEMPRE che ci fossero particelle, non per la fibrillazione
+  // in se'. Prima si finisce e si traccia la linea, POI si disegnano le
+  // particelle sopra.
+  const jittered = bandsData.polylines.map(poly => jitterFlat(poly, vib.ph, vib.vibAmt, vib.chaosAmt, vib.chaosPh));
+
   if(lineAlpha>0.003){
+    sctx.beginPath();
+    jittered.forEach(pts => strokeSmoothPath(sctx, pts, destSize));
     sctx.strokeStyle = strokeRGB;
     sctx.lineWidth = baseWidth + onsetPulse*1.1;
     sctx.lineCap = 'round';
     sctx.lineJoin = 'round';
     sctx.globalAlpha = lineAlpha;
     sctx.stroke();
+  }
+  if(showParticles){
+    jittered.forEach(pts => drawParticlesAlongPath(pts, destSize, scale, strokeRGB, particleAlpha, vib.ph, fibrillation));
   }
   sctx.restore();
 }
@@ -1081,12 +1142,16 @@ function currentVib(level){
   return { ph: visualPhaseMain, vibAmt, chaosAmt, chaosPh: visualPhaseChaos };
 }
 
-// fibrillazione: 0 finche' la resonance resta nella fase "solo tremore veloce";
-// sale con continuita' solo dopo, e solo se c'e' davvero energia sonora
-// (niente particelle nel silenzio, per quanto la manopola sia alzata)
+// fibrillazione: 0 nella prima parte della corsa (solo tremore veloce);
+// sale con continuita' da li' in poi su una finestra AMPIA (35%->100% di
+// resonance, non piu' solo l'ultimo quinto) — la finestra stretta di prima
+// e la comparsa uniforme delle particelle su tutti i vertici insieme
+// facevano sentire il passaggio come uno scatto secco, non una transizione
+// (vedi anche il gate per-vertice in drawParticlesAlongPath). Zero anche
+// nel silenzio, per quanto la manopola sia alzata.
 function currentFibrillation(level){
   const resoNorm = state.resonancePct/100;
-  const raw = clamp((resoNorm-0.55)/0.45, 0, 1) * clamp((level-0.15)/0.5, 0, 1);
+  const raw = clamp((resoNorm-0.35)/0.65, 0, 1) * clamp((level-0.15)/0.5, 0, 1);
   return raw*raw*(3-2*raw); // smoothstep, transizione morbida
 }
 
