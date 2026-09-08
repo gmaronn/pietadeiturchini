@@ -255,7 +255,28 @@ function computeSobelMagnitude(img, res){
       mag[i] = Math.sqrt(gx*gx+gy*gy);
     }
   }
-  return mag;
+  // il ciclo sopra parte da 1 e si ferma a res-2: l'anello esterno (1px)
+  // non viene mai scritto e resta a magnitudine ESATTAMENTE zero. A soglie
+  // basse (volume alto) il marching squares lo scambia per un vero
+  // contorno, disegnando solo il perimetro dell'immagine. Fix: replica il
+  // valore piu' vicino (clamp-to-edge), come un bordo Sobel dovrebbe fare.
+  for(let x=0;x<res;x++){
+    mag[x] = mag[res+x];
+    mag[(res-1)*res+x] = mag[(res-2)*res+x];
+  }
+  for(let y=0;y<res;y++){
+    mag[y*res] = mag[y*res+1];
+    mag[y*res+(res-1)] = mag[y*res+(res-2)];
+  }
+  // percentili REALI del campo (non un numero fisso globale): la
+  // distribuzione dei valori Sobel varia moltissimo da marmo a marmo
+  // (mediana ~23 per un marmo tenue, ~103 per uno molto inciso) — una
+  // soglia assoluta uguale per tutti va spesso fuori scala. p88 = soglia
+  // "rada" (poche venature, le piu' marcate), p50 = soglia "densa" (la
+  // meta' del campo, il punto di massimo dettaglio del contorno).
+  const sorted = Array.from(mag).sort((a,b)=>a-b);
+  const pct = p => sorted[Math.floor(p*(sorted.length-1))];
+  return { mag, p50: pct(0.50), p88: pct(0.88) };
 }
 function loadAllMarbles(){
   const notes = Object.keys(MARBLE_B64);
@@ -833,7 +854,6 @@ Object.keys(KNOB_DEFS).forEach(name=>{
    ===================================================== */
 const stage = document.getElementById('stage');
 const sctx = stage.getContext('2d');
-const animClockStart = performance.now();
 const CONTOUR_RES = 150;
 const COLOR_COOL = [0x3a,0x5a,0x78];
 const COLOR_WARM = [0xb0,0x5a,0x28];
@@ -918,13 +938,24 @@ function computeBands(cell){
   const p = ((cell.pos%12)+12)%12;
   const i0 = Math.floor(p)%12, i1=(i0+1)%12, t = p-Math.floor(p);
   const n0 = NOTE_NAMES[i0], n1 = NOTE_NAMES[i1];
-  const magA = magMaps[n0], magB = magMaps[n1];
-  if(!magA || !magB) return null;
+  const A = magMaps[n0], B = magMaps[n1];
+  if(!A || !B) return null;
 
   const level = clamp(volFraction()*cell.env, 0, 1);
   if(level<=0.004) return null;
-  const threshold = clamp(250 - level*270, 0, 255);
-  const sampler = staticSampler(magA, magB, t);
+  // soglia derivata dai percentili REALI di QUESTA coppia di marmi (mai un
+  // numero fisso globale): a livello minimo parte dal percentile "rado" (le
+  // venature piu' marcate soltanto), a livello massimo arriva al percentile
+  // "denso" (meta' del campo — il punto di massimo dettaglio) e SI FERMA
+  // LI'. La formula precedente continuava a scendere oltre la mediana fino
+  // a un estremo quasi-zero: il disegno cresceva con il volume solo fino a
+  // un certo punto, poi si svuotava di nuovo salendo ancora — il "buco"
+  // segnalato. Cosi' invece la densita' sale con continuita' e non degenera
+  // mai, ne' a volume basso ne' al massimo.
+  const hiThresh = A.p88*(1-t) + B.p88*t;
+  const loThresh = A.p50*(1-t) + B.p50*t;
+  const threshold = mapRange(level, 0.004, 1, hiThresh, loThresh);
+  const sampler = staticSampler(A.mag, B.mag, t);
 
   const polylines = traceContours(sampler, CONTOUR_RES, threshold);
   if(!polylines.length) return null;
@@ -1021,15 +1052,33 @@ function drawBandsInto(bandsData, destX, destY, destSize, color, flipH, flipV, v
   sctx.restore();
 }
 
-function currentVib(level){
-  const now = (Audio_.ctx ? Audio_.ctx.currentTime : (performance.now()-animClockStart)/1000);
-  // l'acuto accelera ulteriormente il tremore (leggerezza/nervosismo); la
-  // resonance stessa agisce SOLO su lfoRateHz (velocita'), mai sull'ampiezza
+// FASE DEL TREMORE — accumulata per integrazione (fase += velocita'*dt ad
+// ogni frame), MAI ricalcolata come now*velocita'. La velocita' (vibSpeed)
+// cambia in continuazione — la resonance la guida, e l'energia in banda
+// alta del suono la accelera ulteriormente frame per frame — quindi
+// "adesso*velocita'-di-adesso" fa saltare la fase ogni volta che la
+// velocita' cambia (letteralmente ad ogni frame, per via dell'energia
+// audio che fluttua): il tremore sembra un effetto sovraimposto e slegato
+// dal suono invece di un'oscillazione continua. Integrando nel tempo la
+// fase resta continua qualunque cosa faccia la velocita' istante per
+// istante — cosi' l'oscillazione visiva e' davvero la stessa, sempre in
+// evoluzione, di quella udibile (lfoRateHz guida entrambe).
+let visualPhaseMain = 0, visualPhaseChaos = 0, lastPhaseTime = null;
+function advanceVisualPhase(){
+  const now = performance.now()/1000;
+  if(lastPhaseTime===null) lastPhaseTime = now;
+  const dt = clamp(now-lastPhaseTime, 0, 0.05); // clampato: niente salti dopo un tab in background
+  lastPhaseTime = now;
   const speedMul = 1 + AudioFeatures.highE*1.6;
   const vibSpeed = lfoRateHz()*speedMul;
+  visualPhaseMain += vibSpeed*dt;
+  visualPhaseChaos += (vibSpeed*2.3+1.7)*dt;
+}
+
+function currentVib(level){
   const vibAmt = HANDDRAWN_AMT * (0.3+level*0.85);
   const chaosAmt = (0.006 + onsetPulse*0.02) * (0.2+level*0.9) * AudioFeatures.flatness;
-  return { ph: now*vibSpeed, vibAmt, chaosAmt, chaosPh: now*(vibSpeed*2.3+1.7) };
+  return { ph: visualPhaseMain, vibAmt, chaosAmt, chaosPh: visualPhaseChaos };
 }
 
 // fibrillazione: 0 finche' la resonance resta nella fase "solo tremore veloce";
@@ -1096,6 +1145,7 @@ function frame(){
   micEnvCurrent += (micEnvTarget - micEnvCurrent)*0.12;
   if(Audio_.ctx) updateAudioFeatures();
   onsetPulse = Math.max(AudioFeatures.onset, onsetPulse*0.80);
+  advanceVisualPhase();
 
   if(state.mode==='solo'){
     updateEnvelope(state.soloCell);
