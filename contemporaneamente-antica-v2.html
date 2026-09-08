@@ -805,25 +805,39 @@ Object.keys(KNOB_DEFS).forEach(name=>{
    TIMBRO -> MOTO: centroide/flatness/bande/onset guidano
    moto e colore, come nella versione precedente.
 
-   NUOVO — FIBRILLAZIONE (resonance -> particelle):
-   alla soglia principale, quando risonanza*livello e'
-   alta, i vertici GIA' ESTRATTI (mai il campionamento —
-   resta valido il principio "si vibra solo il tratto
-   trovato, mai cio' che decide dove sta la curva") non
-   restano piu' una linea continua ma si frammentano in un
-   pulviscolo di piccoli punti la cui fase e' la STESSA
-   fase condivisa dell'LFO audio (vibSpeed/ph di currentVib):
-   e' un'estensione dello stesso meccanismo di vibrazione,
-   non un sistema di particelle indipendente. A risonanza
-   bassa resta una linea liscia come prima; la transizione
-   e' continua (mai a scatto).
+   VENATURE COME CURVE DI LIVELLO (cartina altimetrica):
+   il marching squares emette segmenti sparsi cella per
+   cella; qui vengono CONCATENATI in contorni continui
+   (traceContours, sotto) e disegnati con una curva morbida
+   (quadraticCurveTo attraverso i punti medi) invece di
+   spezzate spigolose — stesso identico campo Sobel, stessa
+   soglia, solo un tratto piu' sinuoso.
+
+   RESONANCE — due fasi distinte, mai una terza cosa:
+   1) bassa/media: la linea gia' tracciata trema con
+      un'ampiezza PICCOLA E COSTANTE (effetto "hand-drawn",
+      tipo Roughen/CC di After Effects) — la resonance ne
+      accelera solo la VELOCITA' di oscillazione, mai
+      l'ampiezza, quindi la forma reale del marmo non si
+      distorce mai, per quanto si giri la manopola.
+   2) alta: oltre una soglia (resonance*livello alti), la
+      linea gia' tremante comincia a scomporsi in un
+      pulviscolo di particelle piccole e nitide, sulla
+      STESSA fase condivisa dell'LFO audio — estensione
+      dello stesso meccanismo di vibrazione, non un sistema
+      di particelle indipendente. La transizione tra le due
+      fasi e' continua (smoothstep, mai a scatto).
+   La resonance e' un parametro manuale (come su un synth
+   vero): il microfono non la determina mai, guida solo
+   nota e timbro.
    ===================================================== */
 const stage = document.getElementById('stage');
 const sctx = stage.getContext('2d');
 const animClockStart = performance.now();
-const CONTOUR_RES = 145;
+const CONTOUR_RES = 150;
 const COLOR_COOL = [0x3a,0x5a,0x78];
 const COLOR_WARM = [0xb0,0x5a,0x28];
+const HANDDRAWN_AMT = 0.0032; // ampiezza fissa del tremore "a mano libera", indipendente dalla resonance
 let onsetPulse = 0;
 
 function currentColorFor(cell){
@@ -846,6 +860,60 @@ function staticSampler(magA, magB, t){
   };
 }
 
+// concatena i segmenti sparsi del marching squares in contorni continui
+// (poligonali ordinate): due celle adiacenti che condividono lo stesso
+// spigolo del campo calcolano ESATTAMENTE lo stesso punto di incrocio, quindi
+// gli estremi combaciano byte per byte e si possono incatenare per chiave.
+function traceContours(sampleFn, gridRes, threshold){
+  const raw = [];
+  marchingSquares(sampleFn, gridRes, threshold, raw);
+  const segCount = raw.length/4;
+  if(!segCount) return [];
+
+  const Q = 1000000;
+  function keyOf(x,y){ return Math.round(x*Q)*20000000 + Math.round(y*Q); }
+  const pointMap = new Map();
+  for(let s=0; s<segCount; s++){
+    const i = s*4;
+    const k0 = keyOf(raw[i],   raw[i+1]);
+    const k1 = keyOf(raw[i+2], raw[i+3]);
+    if(!pointMap.has(k0)) pointMap.set(k0, []);
+    if(!pointMap.has(k1)) pointMap.set(k1, []);
+    pointMap.get(k0).push(s*2);     // segIdx*2 + endpoint(0)
+    pointMap.get(k1).push(s*2+1);   // segIdx*2 + endpoint(1)
+  }
+
+  const used = new Uint8Array(segCount);
+  const polylines = [];
+  function extend(chain, forward){
+    while(true){
+      const tx = forward ? chain[chain.length-2] : chain[0];
+      const ty = forward ? chain[chain.length-1] : chain[1];
+      const cands = pointMap.get(keyOf(tx,ty));
+      if(!cands) return;
+      let code = -1;
+      for(const c of cands){ if(!used[c>>1]){ code = c; break; } }
+      if(code<0) return;
+      const segIdx = code>>1, endIdx = code&1;
+      used[segIdx] = 1;
+      const j = segIdx*4;
+      const ox = endIdx===0 ? raw[j+2] : raw[j];
+      const oy = endIdx===0 ? raw[j+3] : raw[j+1];
+      if(forward){ chain.push(ox,oy); } else { chain.unshift(ox,oy); }
+    }
+  }
+  for(let s=0; s<segCount; s++){
+    if(used[s]) continue;
+    used[s] = 1;
+    const i = s*4;
+    const chain = [raw[i], raw[i+1], raw[i+2], raw[i+3]];
+    extend(chain, true);
+    extend(chain, false);
+    polylines.push(chain);
+  }
+  return polylines;
+}
+
 function computeBands(cell){
   const p = ((cell.pos%12)+12)%12;
   const i0 = Math.floor(p)%12, i1=(i0+1)%12, t = p-Math.floor(p);
@@ -855,21 +923,12 @@ function computeBands(cell){
 
   const level = clamp(volFraction()*cell.env, 0, 1);
   if(level<=0.004) return null;
-  const mainThreshold = clamp(250 - level*270, 0, 255);
+  const threshold = clamp(250 - level*270, 0, 255);
   const sampler = staticSampler(magA, magB, t);
 
-  const bands = [];
-  const specs = [
-    {th: clamp(mainThreshold+34,0,255), alpha:0.30, isMain:false},
-    {th: mainThreshold,                 alpha:1.0,  isMain:true },
-    {th: clamp(mainThreshold-34,0,255), alpha:0.42, isMain:false}
-  ];
-  specs.forEach(s=>{
-    const flat = [];
-    marchingSquares(sampler, CONTOUR_RES, s.th, flat);
-    if(flat.length) bands.push({flat, alpha:s.alpha, isMain:s.isMain});
-  });
-  return {bands, level};
+  const polylines = traceContours(sampler, CONTOUR_RES, threshold);
+  if(!polylines.length) return null;
+  return {polylines, level};
 }
 
 function jitterFlat(flat, ph, vibAmt, chaosAmt, chaosPh){
@@ -890,11 +949,47 @@ function jitterFlat(flat, ph, vibAmt, chaosAmt, chaosPh){
   return out;
 }
 
+// disegna una polilinea gia' jitterata come curva morbida (quadraticCurveTo
+// attraverso i punti medi): stesso identico tracciato, ma sinuoso invece di
+// spigoloso — la tecnica standard per "curve di livello" leggibili.
+function strokeSmoothPath(ctx, pts, destSize){
+  const n = pts.length/2;
+  if(n<2) return;
+  ctx.moveTo(pts[0]*destSize, pts[1]*destSize);
+  if(n===2){ ctx.lineTo(pts[2]*destSize, pts[3]*destSize); return; }
+  for(let i=0;i<n-2;i++){
+    const cx = pts[i*2+2]*destSize, cy = pts[i*2+3]*destSize;
+    const nx = pts[i*2+4]*destSize, ny = pts[i*2+5]*destSize;
+    ctx.quadraticCurveTo(cx, cy, (cx+nx)/2, (cy+ny)/2);
+  }
+  ctx.lineTo(pts[(n-1)*2]*destSize, pts[(n-1)*2+1]*destSize);
+}
+
 // pseudo-hash spaziale stabile (per sfasare le particelle tra loro pur
 // restando agganciate alla stessa fase base — "famiglia" coerente, non rumore indipendente)
 function spatialHash(x,y){
   const s = Math.sin(x*127.1 + y*311.7)*43758.5453;
   return s - Math.floor(s);
+}
+
+// pulviscolo piccolo e nitido (nucleo netto + alone sottile), non "zoomato":
+// il raggio e' scalato su destSize cosi' resta identico in proporzione sia
+// in SOLO sia nei quattro quadranti di CHORD.
+function drawParticlesAlongPath(pts, destSize, scale, strokeRGB, particleAlpha, ph){
+  sctx.fillStyle = strokeRGB;
+  for(let i=0;i<pts.length;i+=2){
+    const px = pts[i]*destSize, py = pts[i+1]*destSize;
+    const h = spatialHash(pts[i], pts[i+1]);
+    const pulse = 0.5 + 0.5*Math.sin(ph*4.0 + h*Math.PI*2);
+    const hx = spatialHash(pts[i]+0.011, pts[i+1]-0.013);
+    const spread = 1.3*scale;
+    const ox = (hx-0.5)*spread, oy = (spatialHash(hx,h)-0.5)*spread;
+    const core = scale*(0.55+0.55*pulse);
+    sctx.globalAlpha = clamp(particleAlpha*0.4*pulse, 0, 1);
+    sctx.beginPath(); sctx.arc(px+ox, py+oy, core*1.8, 0, Math.PI*2); sctx.fill();
+    sctx.globalAlpha = clamp(particleAlpha*pulse, 0, 1);
+    sctx.beginPath(); sctx.arc(px+ox, py+oy, core, 0, Math.PI*2); sctx.fill();
+  }
 }
 
 function drawBandsInto(bandsData, destX, destY, destSize, color, flipH, flipV, vib, fibrillation){
@@ -903,69 +998,46 @@ function drawBandsInto(bandsData, destX, destY, destSize, color, flipH, flipV, v
   sctx.scale(flipH?-1:1, flipV?-1:1);
   const baseWidth = mapRange(AudioFeatures.lowE, 0, 1, 0.95, 2.1);
   const strokeRGB = rgbStr(color);
-  bandsData.bands.forEach(band=>{
-    const pts = jitterFlat(band.flat, vib.ph, vib.vibAmt, vib.chaosAmt, vib.chaosPh);
-    const fib = band.isMain ? fibrillation : fibrillation*0.35; // le bande d'eco fibrillano meno, restano piu' "fantasma"
-    const baseAlpha = bandsData.level>0 ? band.alpha * Math.min(1, bandsData.level*1.6 + 0.15) : 0;
-    const lineAlpha = Math.min(1, baseAlpha*(1-fib*0.85) + onsetPulse*0.25*band.alpha);
+  const baseAlpha = bandsData.level>0 ? Math.min(1, bandsData.level*1.6 + 0.15) : 0;
+  const lineAlpha = Math.min(1, baseAlpha*(1-fibrillation*0.85) + onsetPulse*0.25);
+  const showParticles = fibrillation>0.02;
+  const particleAlpha = baseAlpha*fibrillation;
+  const scale = destSize/640;
 
-    // linea continua (piena a fibrillazione 0, si affievolisce salendo la fibrillazione ma non sparisce mai del tutto)
-    if(lineAlpha>0.003){
-      sctx.beginPath();
-      for(let i=0;i<pts.length;i+=4){
-        sctx.moveTo(pts[i]*destSize, pts[i+1]*destSize);
-        sctx.lineTo(pts[i+2]*destSize, pts[i+3]*destSize);
-      }
-      sctx.strokeStyle = strokeRGB;
-      sctx.lineWidth = baseWidth + onsetPulse*1.1;
-      sctx.lineCap = 'round';
-      sctx.globalAlpha = lineAlpha;
-      sctx.stroke();
-    }
-
-    // pulviscolo di particelle: appare gradualmente sopra la soglia principale
-    // quando risonanza+livello sono alti, stessa fase LFO condivisa (vib.ph)
-    if(fib>0.02){
-      sctx.fillStyle = strokeRGB;
-      const particleAlpha = baseAlpha * fib;
-      for(let i=0;i<pts.length;i+=4){
-        const mx = (pts[i]+pts[i+2])/2*destSize, my = (pts[i+1]+pts[i+3])/2*destSize;
-        const h = spatialHash(pts[i], pts[i+1]);
-        // ogni particella pulsa sulla STESSA fase condivisa (vib.ph), sfasata nello spazio da h
-        const pulse = 0.55 + 0.45*Math.sin(vib.ph*4.0 + h*Math.PI*2);
-        const count = fib>0.6 ? 2 : 1;
-        for(let k=0;k<count;k++){
-          const hk = spatialHash(pts[i]+k*0.013, pts[i+1]-k*0.017);
-          const spread = (1.4 + fib*2.6) * destSize/640;
-          const ox = (hk-0.5)*spread, oy = (spatialHash(hk,h)-0.5)*spread;
-          const r = (0.55 + 0.85*fib) * pulse;
-          sctx.globalAlpha = clamp(particleAlpha*pulse, 0, 1);
-          sctx.beginPath();
-          sctx.arc(mx+ox, my+oy, r, 0, Math.PI*2);
-          sctx.fill();
-        }
-      }
-    }
+  if(lineAlpha>0.003) sctx.beginPath();
+  bandsData.polylines.forEach(poly=>{
+    const pts = jitterFlat(poly, vib.ph, vib.vibAmt, vib.chaosAmt, vib.chaosPh);
+    if(lineAlpha>0.003) strokeSmoothPath(sctx, pts, destSize);
+    if(showParticles) drawParticlesAlongPath(pts, destSize, scale, strokeRGB, particleAlpha, vib.ph);
   });
+  if(lineAlpha>0.003){
+    sctx.strokeStyle = strokeRGB;
+    sctx.lineWidth = baseWidth + onsetPulse*1.1;
+    sctx.lineCap = 'round';
+    sctx.lineJoin = 'round';
+    sctx.globalAlpha = lineAlpha;
+    sctx.stroke();
+  }
   sctx.restore();
 }
 
 function currentVib(level){
   const now = (Audio_.ctx ? Audio_.ctx.currentTime : (performance.now()-animClockStart)/1000);
+  // l'acuto accelera ulteriormente il tremore (leggerezza/nervosismo); la
+  // resonance stessa agisce SOLO su lfoRateHz (velocita'), mai sull'ampiezza
   const speedMul = 1 + AudioFeatures.highE*1.6;
   const vibSpeed = lfoRateHz()*speedMul;
-  const vibAmt = mapRange(state.resonancePct,0,100, 0.0015, 0.014) * (0.3+level*0.85);
+  const vibAmt = HANDDRAWN_AMT * (0.3+level*0.85);
   const chaosAmt = (0.006 + onsetPulse*0.02) * (0.2+level*0.9) * AudioFeatures.flatness;
   return { ph: now*vibSpeed, vibAmt, chaosAmt, chaosPh: now*(vibSpeed*2.3+1.7) };
 }
 
-// fibrillazione: 0 a risonanza/livello bassi, sale con continuita' quando
-// ENTRAMBI risonanza e livello sono alti (niente fibrillazione nel silenzio,
-// per quanto la manopola sia alzata) — coerente col principio "si anima solo
-// quando c'e' davvero energia sonora"
+// fibrillazione: 0 finche' la resonance resta nella fase "solo tremore veloce";
+// sale con continuita' solo dopo, e solo se c'e' davvero energia sonora
+// (niente particelle nel silenzio, per quanto la manopola sia alzata)
 function currentFibrillation(level){
   const resoNorm = state.resonancePct/100;
-  const raw = clamp((resoNorm-0.45)/0.55, 0, 1) * clamp((level-0.15)/0.5, 0, 1);
+  const raw = clamp((resoNorm-0.55)/0.45, 0, 1) * clamp((level-0.15)/0.5, 0, 1);
   return raw*raw*(3-2*raw); // smoothstep, transizione morbida
 }
 
@@ -1057,20 +1129,30 @@ function exportSVG(){
   const color = currentColorFor(cell);
   const strokeColor = rgbStr(color);
 
-  function emitBand(band, transform){
-    const alpha = bandsData.level>0 ? band.alpha*Math.min(1,bandsData.level*1.6+0.15) : 0;
-    if(alpha<=0.01) return '';
-    let d = '';
-    for(let i=0;i<band.flat.length;i+=4){
-      d += `M${(band.flat[i]).toFixed(4)},${(band.flat[i+1]).toFixed(4)} L${(band.flat[i+2]).toFixed(4)},${(band.flat[i+3]).toFixed(4)} `;
+  const alpha = bandsData && bandsData.level>0 ? Math.min(1,bandsData.level*1.6+0.15) : 0;
+  // stessa curva morbida vista a schermo (quadraticCurveTo attraverso i punti
+  // medi), tradotta in comandi SVG Q — export vettoriale pulito, senza
+  // fibrillazione/tremore live (e' il ricalco, non l'esibizione).
+  function emitPolyline(poly, transform){
+    const n = poly.length/2;
+    if(n<2 || alpha<=0.01) return '';
+    let d = `M${poly[0].toFixed(4)},${poly[1].toFixed(4)} `;
+    if(n===2){
+      d += `L${poly[2].toFixed(4)},${poly[3].toFixed(4)} `;
+    } else {
+      for(let i=0;i<n-2;i++){
+        const cx=poly[i*2+2], cy=poly[i*2+3], nx=poly[i*2+4], ny=poly[i*2+5];
+        d += `Q${cx.toFixed(4)},${cy.toFixed(4)} ${((cx+nx)/2).toFixed(4)},${((cy+ny)/2).toFixed(4)} `;
+      }
+      d += `L${poly[(n-1)*2].toFixed(4)},${poly[(n-1)*2+1].toFixed(4)} `;
     }
-    return `<path d="${d}" transform="${transform}" stroke="${strokeColor}" stroke-opacity="${alpha.toFixed(3)}" stroke-width="0.0016" stroke-linecap="round" fill="none"/>`;
+    return `<path d="${d}" transform="${transform}" stroke="${strokeColor}" stroke-opacity="${alpha.toFixed(3)}" stroke-width="0.0016" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
   }
 
   if(!bandsData){
     // niente da esportare (silenzio): file bianco valido comunque
   } else if(state.mode==='solo'){
-    bandsData.bands.forEach(band=>{ body += emitBand(band, `scale(${W})`); });
+    bandsData.polylines.forEach(poly=>{ body += emitPolyline(poly, `scale(${W})`); });
   } else {
     const half = W/2;
     const transforms = [
@@ -1080,7 +1162,7 @@ function exportSVG(){
       `translate(${W},${W}) scale(${-half},${-half})`
     ];
     transforms.forEach(tr=>{
-      bandsData.bands.forEach(band=>{ body += emitBand(band, tr); });
+      bandsData.polylines.forEach(poly=>{ body += emitPolyline(poly, tr); });
     });
   }
 
@@ -1165,19 +1247,17 @@ function exportPNG300(){
       bctx.translate(destX + (flipH?destSize:0), destY + (flipV?destSize:0));
       bctx.scale(flipH?-1:1, flipV?-1:1);
       const baseWidth = mapRange(AudioFeatures.lowE, 0, 1, 0.95, 2.1);
-      bandsData.bands.forEach(band=>{
-        const pts = jitterFlat(band.flat, vib.ph, vib.vibAmt, vib.chaosAmt, vib.chaosPh);
-        bctx.beginPath();
-        for(let i=0;i<pts.length;i+=4){
-          bctx.moveTo(pts[i]*destSize, pts[i+1]*destSize);
-          bctx.lineTo(pts[i+2]*destSize, pts[i+3]*destSize);
-        }
-        bctx.strokeStyle = rgbStr(color);
-        bctx.lineWidth = ((baseWidth+onsetPulse*1.1)/640)*destSize*2;
-        bctx.lineCap = 'round';
-        bctx.globalAlpha = bandsData.level>0 ? band.alpha*Math.min(1,bandsData.level*1.6+0.15) : 0;
-        bctx.stroke();
+      bctx.beginPath();
+      bandsData.polylines.forEach(poly=>{
+        const pts = jitterFlat(poly, vib.ph, vib.vibAmt, vib.chaosAmt, vib.chaosPh);
+        strokeSmoothPath(bctx, pts, destSize);
       });
+      bctx.strokeStyle = rgbStr(color);
+      bctx.lineWidth = ((baseWidth+onsetPulse*1.1)/640)*destSize*2;
+      bctx.lineCap = 'round';
+      bctx.lineJoin = 'round';
+      bctx.globalAlpha = bandsData.level>0 ? Math.min(1,bandsData.level*1.6+0.15) : 0;
+      bctx.stroke();
       bctx.restore();
     };
     if(state.mode==='solo'){
