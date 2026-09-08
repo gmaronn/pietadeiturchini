@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Contemporaneamente Antica — Fondazione Pietà de' Turchini</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/src/style.css">
+</head>
+<body>
+
+<div class="device">
+  <div class="top-label">
+    <span>CONTEMPORANEAMENTE ANTICA</span>
+    <span class="sub">Pietà de' Turchini · S. Caterina da Siena</span>
+  </div>
+
+  <div class="display-wrap">
+    <div id="stage-holder"></div>
+    <div class="hz-indicator" id="hzIndicator">— Hz</div>
+    <div class="mode-corner" id="modeCorner">SOLO</div>
+  </div>
+
+  <div class="controls-row">
+    <div class="knobs">
+      <div class="knob-unit">
+        <div class="knob" id="knobCutoff"></div>
+        <div class="knob-label">CUTOFF</div>
+        <div class="knob-value" id="valCutoff">50%</div>
+      </div>
+      <div class="knob-unit">
+        <div class="knob" id="knobResonance"></div>
+        <div class="knob-label">RESONANCE</div>
+        <div class="knob-value" id="valResonance">20%</div>
+      </div>
+      <div class="knob-unit">
+        <div class="knob" id="knobVolume"></div>
+        <div class="knob-label">VOLUME</div>
+        <div class="knob-value" id="valVolume">55%</div>
+      </div>
+      <div class="knob-unit" id="pitchUnit">
+        <div class="knob pitch-knob" id="knobPitch"></div>
+        <div class="knob-label">PITCH</div>
+        <div class="knob-value" id="valPitch">C</div>
+      </div>
+      <div class="note-chip-mini" id="noteChipMini"><span class="swatch-mini" id="swatchMini"></span><span id="moodMini"></span></div>
+    </div>
+
+    <div class="mode-mic-group">
+      <div class="toggle-pair">
+        <button id="soloBtn" class="active">SOLO</button>
+        <button id="chordBtn">CHORD</button>
+      </div>
+      <button id="colorModeBtn">B/N</button>
+    </div>
+  </div>
+
+  <div class="controls-row" style="padding-top:0;">
+    <div class="toggle-pair">
+      <button id="micBtn">MIC</button>
+      <button id="trackBtn">TRACCIA</button>
+      <input type="file" id="audioFileInput" accept="audio/*" style="display:none">
+    </div>
+    <div class="toggle-pair">
+      <button id="exportBtn">JPEG</button>
+      <button id="exportSvgBtn">SVG</button>
+      <button id="exportPngBtn">PNG 300dpi</button>
+    </div>
+  </div>
+
+  <div class="play-row" id="playRow">
+    <button id="playBtn">▶ &nbsp; SUONA</button>
+  </div>
+</div>
+
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
